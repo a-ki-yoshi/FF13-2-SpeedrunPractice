@@ -38,15 +38,21 @@ void ff132_flash_c(const char* utf8, unsigned long argb) {
 }
 void ff132_flash(const char* utf8) { ff132_flash_c(utf8, FF132_OVL_FLASH); }
 
-// ---- fonts (EXACTLY the FF13 mod's faces and sizes) ------------------------------------------------
+// ---- fonts (at 100%, EXACTLY the FF13 mod's faces and sizes) --------------------------------------
 #define OVL_FONT_FACE    "Courier New"
 #define OVL_FONT_FACE_JP "Meiryo UI"
 // The Japanese face runs two points smaller: at the same requested height Meiryo's ideographs fill
 // more of the cell than Courier's letters and read as the larger type on a mixed line.
 #define OVL_FONT_H     20
 #define OVL_FONT_H_JP  18
+#define OVL_LINE_H     24          // one row; FF132_OVL_LINE_H is this at the size in force
+#define OVL_MARGIN     14          // the gap kept to the screen's left, top and right edges
 // Stands in only until the two faces have been asked for their metrics (see g_jpYoff).
 #define OVL_JP_YOFF    ((OVL_FONT_H - OVL_FONT_H_JP) / 2)
+// [overlay] font_scale multiplies every size above and every distance a block is laid out with
+// (ff132_ovl_px). Auto keeps the overlay the share of the screen it has at 720 lines -- the height
+// its layout was made at -- and never goes below 100%.
+#define OVL_AUTO_REF_H 720
 
 // ============================================================================
 // D3D9 overlay core.
@@ -162,6 +168,7 @@ static volatile int g_dummyHooked = 0;  // the throwaway's EndScene patch took
 static void* g_bbCache    = NULL;
 static void* g_bbCacheDev = NULL;     // the device g_bbCache belongs to (refetched if it changes)
 static int   g_bbWidth    = 0;
+static int   g_bbHeight   = 0;        // what auto sizes the text from, and what a menu must fit in
 static void* g_font         = NULL;   // ID3DXFont* (Latin; lazily created on the real device)
 static void* g_fontJp       = NULL;   // ID3DXFont* (Japanese)
 static volatile LONG g_fontJpMissing = 0;   // set once the Japanese font failed to be made
@@ -171,6 +178,17 @@ static void* g_spriteActive = NULL;   // = g_sprite only between Begin/End; what
 // asked of the fonts themselves. Set once at font creation; the fixed nudge stands in until then.
 static int g_jpYoff = OVL_JP_YOFF;
 static volatile LONG g_fontTried = 0;   // create the font at most once (until a device reset)
+// The text size the faces in force were made at, and the sizes that follow from it. Render thread
+// only: every reader is a drawing helper, and the faces are only ever swapped between two passes.
+static int g_scalePct  = 100;
+static int g_fontPx    = OVL_FONT_H;
+static int g_fontPxJp  = OVL_FONT_H_JP;
+static int g_lineH     = OVL_LINE_H;
+static int g_scaleFail = 0;             // a size whose faces could not be made: not asked for again
+static D3DXCreateFontA_t g_pCreateFont = NULL;   // kept from the first make, for every remake
+// A distance designed at 100%, at the size in force. Rounded, so 100% is exactly the old layout.
+static int ovl_scaled(int px, int pct) { return (px * pct + 50) / 100; }
+static int ovl_margin(void) { return ovl_scaled(OVL_MARGIN, g_scalePct); }
 // Back-buffer-pass detection state. g_bbFallback latches once it is clear this game never binds the
 // back buffer on an EndScene pass; the rest are one-shot log guards.
 static int g_bbSeen = 0, g_bbMisses = 0, g_bbFallback = 0;
@@ -180,8 +198,10 @@ static int g_devBadLogged = 0;   // one-shot: the device global held something u
 // The black behind every line: 0 = a single shadow (2 draws per line), 1 = four diagonals (5),
 // 2 = all eight neighbours (9). Shipped at 0.
 #define OVL_OUTLINE 0
-// How far the black sits from the text, in pixels -- a separate knob from the shape.
+// How far the black sits from the text, in pixels at 100% -- a separate knob from the shape. It grows
+// with the text (g_shadowPx), or a large size would wear a hairline of a shadow.
 #define OVL_OFFSET_PX 1
+static int g_shadowPx = OVL_OFFSET_PX;
 // Corners first, then edges, so the 4-offset setting is simply the first four.
 static const int kOvlOutline[8][2] = { {-1,-1}, {1,-1}, {-1,1}, {1,1},
                                        { 0,-1}, {0, 1}, {-1,0}, {1,0} };
@@ -196,13 +216,13 @@ static void overlay_line(void* font, int x, int y, const char* text, DWORD color
     if (!p) return;
     RECT r;
 #if OVL_OUTLINE == 0
-    r.left = x + OVL_OFFSET_PX; r.top = y + OVL_OFFSET_PX;
+    r.left = x + g_shadowPx; r.top = y + g_shadowPx;
     r.right = r.left + 1200; r.bottom = r.top + 60;
     p(font, g_spriteActive, text, -1, &r, DT_NOCLIP_FLAG, 0xFF000000);   // shadow
 #else
     for (int i = 0; i < OVL_OUTLINE_N; i++) {
-        r.left = x + kOvlOutline[i][0] * OVL_OFFSET_PX;
-        r.top  = y + kOvlOutline[i][1] * OVL_OFFSET_PX;
+        r.left = x + kOvlOutline[i][0] * g_shadowPx;
+        r.top  = y + kOvlOutline[i][1] * g_shadowPx;
         r.right = r.left + 1200; r.bottom = r.top + 60;
         p(font, g_spriteActive, text, -1, &r, DT_NOCLIP_FLAG, 0xFF000000);
     }
@@ -233,7 +253,7 @@ static int font_installed(const char* face) {
 
 // The ASCII face is monospace, so one measurement gives every column position. Measured through the
 // font's own DT_CALCRECT rather than assumed, because the advance depends on the height the font was
-// created at. Cached; reset with the font on a device reset.
+// created at. Cached; reset whenever the faces are made again at another size.
 static int g_ovlCw = 0;
 static int overlay_char_w(void* font) {
     if (g_ovlCw) return g_ovlCw;
@@ -245,7 +265,8 @@ static int overlay_char_w(void* font) {
     RECT r; r.left = 0; r.top = 0; r.right = 0; r.bottom = 0;
     p(font, NULL, "MMMMMMMMMMMMMMMMMMMM", 20, &r, DT_CALCRECT_FLAG, 0);
     int w = (int)(r.right - r.left);
-    g_ovlCw = (w > 0) ? (w + 19) / 20 : 12;      // 12 = a sane guess if the measure fails
+    // 3/5 of the height = a sane guess if the measure fails (12 at 100%).
+    g_ovlCw = (w > 0) ? (w + 19) / 20 : (g_fontPx * 3 + 2) / 5;
     return g_ovlCw;
 }
 
@@ -267,8 +288,11 @@ static int font_ascent(void* font) {
 // never clips the glyph drawn before it.
 #define OVL_RUNS_MAX 24
 // The English arrows (U+25C4/U+25BA) are Courier New's own glyphs, drawn in the ASCII face: a
-// non-Japanese Windows often lacks Meiryo UI, and its stand-in may lack the arrows.
-static int latin_face(unsigned short c) { return c < 0x80 || c == 0x25C4 || c == 0x25BA; }
+// non-Japanese Windows often lacks Meiryo UI, and its stand-in may lack the arrows. The settings
+// screen's scroll marks (U+25B2/U+25BC) are drawn there in either language for the same reason.
+static int latin_face(unsigned short c) {
+    return c < 0x80 || c == 0x25C4 || c == 0x25BA || c == 0x25B2 || c == 0x25BC;
+}
 #define JPW_CACHE_N 1024   // per character as well as per run: a menu's footer wraps every frame
 static struct { unsigned h; int len; int w; } g_jpw[JPW_CACHE_N];
 static int jp_run_width(void* font, const unsigned short* s, int len) {
@@ -305,7 +329,9 @@ static int overlay_text_w(const char* utf8) {
     const unsigned char* p = (const unsigned char*)utf8;
     while (*p && *p < 0x80) p++;
     if (!*p) return (g_font ? overlay_char_w(g_font) : 0) * (int)strlen(utf8);
-    unsigned short w[320];
+    // As long as overlay_say_wrap's line: a small text size on a wide screen fits more characters to
+    // a row than a 320-unit buffer would take, and a failed conversion measures 0.
+    unsigned short w[512];
     if (MultiByteToWideChar(CP_UTF8, 0, utf8, -1, (wchar_t*)w, (int)(sizeof w / sizeof w[0])) <= 0)
         return 0;
     return overlay_width_w(w);
@@ -344,13 +370,13 @@ static void overlay_line_w(int x, int y, const unsigned short* text, DWORD color
             RECT r;
             if (pass == 0) {
 #if OVL_OUTLINE == 0
-                r.left = runs[k].x + OVL_OFFSET_PX; r.top = yy + OVL_OFFSET_PX;
+                r.left = runs[k].x + g_shadowPx; r.top = yy + g_shadowPx;
                 r.right = r.left + 1200; r.bottom = r.top + 60;
                 p(runs[k].font, g_spriteActive, runs[k].s, runs[k].len, &r, DT_NOCLIP_FLAG, 0xFF000000);
 #else
                 for (int o = 0; o < OVL_OUTLINE_N; o++) {
-                    r.left = runs[k].x + kOvlOutline[o][0] * OVL_OFFSET_PX;
-                    r.top  = yy + kOvlOutline[o][1] * OVL_OFFSET_PX;
+                    r.left = runs[k].x + kOvlOutline[o][0] * g_shadowPx;
+                    r.top  = yy + kOvlOutline[o][1] * g_shadowPx;
                     r.right = r.left + 1200; r.bottom = r.top + 60;
                     p(runs[k].font, g_spriteActive, runs[k].s, runs[k].len, &r, DT_NOCLIP_FLAG, 0xFF000000);
                 }
@@ -372,7 +398,7 @@ static void overlay_say(void* font, int x, int y, const char* utf8, DWORD color)
     const unsigned char* p = (const unsigned char*)utf8;
     while (*p && *p < 0x80) p++;
     if (!*p) { overlay_line(font, x, y, utf8, color); return; }   // pure ASCII fast path
-    unsigned short w[320];
+    unsigned short w[512];                         // sized as overlay_text_w's, for the same reason
     int n = MultiByteToWideChar(CP_UTF8, 0, utf8, -1, (wchar_t*)w, (int)(sizeof w / sizeof w[0]));
     if (n <= 0) { overlay_line(font, x, y, utf8, color); return; }
     overlay_line_w(x, y, w, color);
@@ -380,7 +406,13 @@ static void overlay_say(void* font, int x, int y, const char* utf8, DWORD color)
 
 // A "\n" in the text is a PREFERRED break, not a hard one: it is used only when the line will not
 // fit, and otherwise it DISAPPEARS -- put any space the joined text needs BEFORE it, never after.
+// The row cap is at 100%; larger text wraps sooner, so the cap grows with it (wrap_rows), or the end
+// of a longer text would simply not be drawn.
 #define OVL_WRAP_LINES 3
+static int wrap_rows(void) {
+    int n = (OVL_WRAP_LINES * g_scalePct + 99) / 100;
+    return n > OVL_WRAP_LINES ? n : OVL_WRAP_LINES;
+}
 // draw = 0 only counts the rows, so a backdrop can be sized before the text goes on it.
 // endX, when given, gets the pixel x where the last row's text ends.
 // One character's advance as overlay_line_w lays it: the ASCII face's cell, or the run face's own
@@ -405,11 +437,12 @@ static int is_jp_comma(const unsigned char* q, int len) {     // 、
 // Measured in pixels, not cells: a Japanese character is narrower than two ASCII cells, and
 // counting it as two broke lines well short of the screen's edge. Where a line has to break and the
 // text names no place for it, the last 。, then the last 、, then the last space is taken -- a 。 or 、
-// only past half the line: an early one would leave the rest more rows than OVL_WRAP_LINES allows.
+// only past half the line: an early one would leave the rest more rows than the cap allows.
 static int overlay_say_wrap(void* font, int x, int contX, int y, const char* utf8, DWORD color,
                             int lineH, int draw, int* endX) {
     int cw = overlay_char_w(font);
-    int budget = (g_bbWidth > 0 && cw > 0) ? (g_bbWidth - x - 14) / cw : 0;
+    int margin = ovl_margin(), cap = wrap_rows();
+    int budget = (g_bbWidth > 0 && cw > 0) ? (g_bbWidth - x - margin) / cw : 0;
     if (endX) *endX = x;
     if (budget < 16) {
         if (draw) overlay_say(font, x, y, utf8, color);
@@ -419,9 +452,9 @@ static int overlay_say_wrap(void* font, int x, int contX, int y, const char* utf
     const unsigned char* p = (const unsigned char*)utf8;
     char line[512];
     int used = 0;
-    while (*p && used < OVL_WRAP_LINES) {
+    while (*p && used < cap) {
         int lx = used ? contX : x;
-        int limPx = g_bbWidth - lx - 14;
+        int limPx = g_bbWidth - lx - margin;
         int px = 0, n = 0;
         int wantN = -1, spaceN = -1, stopN = -1, commaN = -1, stopPx = 0, commaPx = 0;
         const unsigned char* wantQ = NULL, *spaceQ = NULL, *stopQ = NULL, *commaQ = NULL;
@@ -499,6 +532,12 @@ static void overlay_backdrop(void* dev, float x0, float y0, float x1, float y1, 
 int ff132_ovl_char_w(void) { return g_font ? overlay_char_w(g_font) : 0; }
 int ff132_ovl_text_w(const char* utf8) { return g_font ? overlay_text_w(utf8) : 0; }
 int ff132_ovl_ready(void) { return g_font != NULL; }
+int ff132_ovl_line_h(void) { return g_lineH; }
+int ff132_ovl_px(int px) { return ovl_scaled(px, g_scalePct); }
+// 4096 was every backdrop's right edge before the screen's width was known to them; kept as the floor.
+int ff132_ovl_full_w(void) { return g_bbWidth > 4096 ? g_bbWidth : 4096; }
+int ff132_ovl_screen_h(void) { return g_bbHeight; }
+int ff132_ovl_scale_pct(void) { return g_scalePct; }
 // Spaces of several widths, measured and laid widest-first, so a gap narrower than an ASCII cell can
 // still be closed (a kana in the proportional face is a few px). A space the face lacks measures 0
 // and is skipped; under ui_ascii_only only the ASCII one is used.
@@ -561,7 +600,7 @@ int ff132_ovl_wrap_tail(int x, int contX, const char* utf8, const char* tail, in
     int endX = x;
     int rows = g_font ? overlay_say_wrap(g_font, x, contX, 0, utf8, 0, 0, 0, &endX) : 1;
     int tw = g_font ? overlay_text_w(tail) : 0;
-    if (g_bbWidth <= 0 || endX + tw <= g_bbWidth - 14) {
+    if (g_bbWidth <= 0 || endX + tw <= g_bbWidth - ovl_margin()) {
         *tailX = endX; *tailRow = rows - 1;
         return rows;
     }
@@ -573,55 +612,126 @@ void ff132_ovl_backdrop(int x0, int y0, int x1, int y1, unsigned long argb) {
     overlay_backdrop(g_drawDev, (float)x0, (float)y0, (float)x1, (float)y1, (DWORD)argb);
 }
 
+// ---- the text size ------------------------------------------------------------------------------
+// The size the faces should be at now: the setting, with auto worked out against the back buffer.
+static int scale_wanted(void) {
+    int s = g_ovlScale;
+    if (s == FF132_SCALE_AUTO) {
+        int h = g_bbHeight;
+        s = h > 0 ? (h * 100 + OVL_AUTO_REF_H / 2) / OVL_AUTO_REF_H : 100;
+        if (s < 100) s = 100;
+    }
+    if (s < FF132_SCALE_MIN) s = FF132_SCALE_MIN;
+    if (s > FF132_SCALE_MAX) s = FF132_SCALE_MAX;
+    return s;
+}
+
+// The Japanese face is asked for by name ONLY after checking the name is installed: the GDI mapper
+// never fails, it substitutes. NULL is the fallback -- the mapper picks a Japanese-capable font.
+// Looked up once, at the first make; every remake asks for the same face.
+static const char* g_jpFace = NULL;
+
+// One face at px: the ASCII one, or (jp) the Japanese one. NULL = not made (and logged).
+static void* font_new(void* dev, int px, int jp) {
+    const char* face = jp ? g_jpFace : OVL_FONT_FACE;
+    void* f = NULL;
+    // Weight=700(bold), CharSet=1(DEFAULT) or 128(SHIFTJIS), Quality=5(CLEARTYPE).
+    HRESULT hr = g_pCreateFont(dev, px, 0, 700, 1, FALSE, jp ? 128 : 1, 0, 5, 0, face, &f);
+    if (hr < 0 || !f) {
+        ff132_loga(FF132_TAG "overlay: D3DXCreateFontA(%s, height %d) failed hr=0x%08X\n",
+                   face ? face : "system default", px, (unsigned)hr);
+        return NULL;
+    }
+    // ASCII into the glyph atlas now, not on a character's first appearance mid-message.
+    if (!jp) ((PreloadChars_t)(*(void***)f)[FONT_VT_PRELOADCHARS])(f, 0x20, 0x7E);
+    return f;
+}
+
+static void com_release(void* obj) {
+    if (obj) ((Release_t)(*(void***)obj)[IUNK_VT_RELEASE])(obj);
+}
+
+// The faces in force were made at pct: every size and measure taken from the old ones starts over.
+static void scale_take(int pct) {
+    g_scalePct = pct;
+    g_fontPx   = ovl_scaled(OVL_FONT_H, pct);
+    g_fontPxJp = ovl_scaled(OVL_FONT_H_JP, pct);
+    g_lineH    = ovl_scaled(OVL_LINE_H, pct);
+    g_shadowPx = ovl_scaled(OVL_OFFSET_PX, pct);
+    g_ovlCw = 0;
+    memset(g_jpw, 0, sizeof g_jpw);
+    int aA = font_ascent(g_font), aJ = font_ascent(g_fontJp);
+    g_jpYoff = (aA > 0 && aJ > 0) ? aA - aJ : (g_fontPx - g_fontPxJp) / 2;
+    ff132_loga(FF132_TAG "overlay: text at %d%% (heights %d/%d, rows %dpx); ascent ascii %d, jp %d ->"
+                  " jp runs drawn %+dpx (one baseline)\n",
+               pct, g_fontPx, g_fontPxJp, g_lineH, aA, aJ, g_jpYoff);
+}
+
+// The size asked for moved (the setting changed, or auto met another back buffer): both faces are made
+// again and swapped in as a pair, the old pair released only once the new one is in, so the faces in
+// force are never missing. If a new face cannot be made the old pair stays, and that size is not asked
+// for again until another one has been. Render thread, between passes: no draw holds a face across.
+static void overlay_rescale(void* dev, int pct) {
+    if (!g_pCreateFont || !g_font) return;
+    void* font = font_new(dev, ovl_scaled(OVL_FONT_H, pct), 0);
+    void* fj = (font && g_fontJp) ? font_new(dev, ovl_scaled(OVL_FONT_H_JP, pct), 1) : NULL;
+    if (!font || (g_fontJp && !fj)) {
+        com_release(font);
+        g_scaleFail = pct;
+        ff132_loga(FF132_TAG "overlay: the text could not be made at %d%% -- it stays at %d%%\n",
+                   pct, g_scalePct);
+        return;
+    }
+    void* oldA = g_font;
+    void* oldJ = g_fontJp;
+    g_font = font;
+    if (fj) g_fontJp = fj;
+    com_release(oldA);
+    if (fj) com_release(oldJ);
+    g_scaleFail = 0;
+    scale_take(pct);
+}
+
 // Create the two fonts + the sprite against the REAL device, at most once. Runs on the render thread
-// from ff132_overlay_frame.
+// from ff132_overlay_frame. Made at the size asked for as far as it is known: auto has no back
+// buffer to go by on the very first pass, so it starts at 100% and is remade once it has one.
 static void overlay_make_fonts(void* dev) {
     g_fontTried = 1;
     HMODULE hx = GetModuleHandleA("d3dx9_43.dll");
     if (!hx) hx = LoadLibraryA("d3dx9_43.dll");
     if (!hx) { ff132_loga(FF132_TAG "overlay: d3dx9_43.dll not found -> no text\n"); return; }
-    D3DXCreateFontA_t pCreateFont = (D3DXCreateFontA_t)GetProcAddress(hx, "D3DXCreateFontA");
-    if (!pCreateFont) { ff132_loga(FF132_TAG "overlay: D3DXCreateFontA missing\n"); return; }
-    void* font = NULL;
-    // Weight=700(bold), CharSet=1(DEFAULT), Quality=5(CLEARTYPE).
-    HRESULT hr = pCreateFont(dev, OVL_FONT_H, 0, 700, 1, FALSE, 1, 0, 5, 0, OVL_FONT_FACE, &font);
-    if (hr < 0 || !font) {
-        ff132_loga(FF132_TAG "overlay: D3DXCreateFontA(%s) failed hr=0x%08X\n", OVL_FONT_FACE, (unsigned)hr);
-        return;
-    }
+    g_pCreateFont = (D3DXCreateFontA_t)GetProcAddress(hx, "D3DXCreateFontA");
+    if (!g_pCreateFont) { ff132_loga(FF132_TAG "overlay: D3DXCreateFontA missing\n"); return; }
+    int pct = scale_wanted();
+    void* font = font_new(dev, ovl_scaled(OVL_FONT_H, pct), 0);
+    if (!font) return;
     g_font = font;
-    ff132_loga(FF132_TAG "overlay: font ready (%s, height %d)\n", OVL_FONT_FACE, OVL_FONT_H);
-    // ASCII into the glyph atlas now, not on a character's first appearance mid-message.
-    ((PreloadChars_t)(*(void***)font)[FONT_VT_PRELOADCHARS])(font, 0x20, 0x7E);
+    ff132_loga(FF132_TAG "overlay: font ready (%s, height %d)\n", OVL_FONT_FACE, ovl_scaled(OVL_FONT_H, pct));
     // A face without the English arrows would still show them, drawn by GDI from a linked font,
-    // so only the face's own glyph table tells.
+    // so only the face's own glyph table tells. The settings screen's scroll marks are asked too.
     {
-        static const WCHAR kArrows[2] = { 0x25C4, 0x25BA };
-        WORD gi[2];
+        static const WCHAR kArrows[4] = { 0x25C4, 0x25BA, 0x25B2, 0x25BC };
+        WORD gi[4];
         HDC fdc = ((FontGetDC_t)(*(void***)font)[FONT_VT_GETDC])(font);
-        if (fdc && GetGlyphIndicesW(fdc, kArrows, 2, gi, GGI_MARK_NONEXISTING_GLYPHS) == 2)
-            ff132_loga(FF132_TAG "overlay: %s has the English arrows U+25C4/U+25BA: %s (glyphs %u, %u)\n",
+        if (fdc && GetGlyphIndicesW(fdc, kArrows, 4, gi, GGI_MARK_NONEXISTING_GLYPHS) == 4)
+            ff132_loga(FF132_TAG "overlay: %s has the English arrows U+25C4/U+25BA: %s (glyphs %u, %u);"
+                          " the scroll marks U+25B2/U+25BC: %s\n",
                        OVL_FONT_FACE, (gi[0] != 0xFFFF && gi[1] != 0xFFFF) ? "yes" : "NO",
-                       (unsigned)gi[0], (unsigned)gi[1]);
+                       (unsigned)gi[0], (unsigned)gi[1],
+                       (gi[2] != 0xFFFF && gi[3] != 0xFFFF) ? "yes" : "NO");
     }
-    // Asked for by name ONLY after checking the name is installed: the GDI mapper never fails, it
-    // substitutes. A NULL face name is the fallback -- the mapper picks a Japanese-capable font.
-    const char* face = font_installed(OVL_FONT_FACE_JP) ? OVL_FONT_FACE_JP : NULL;
-    void* fj = NULL;
-    if (pCreateFont(dev, OVL_FONT_H_JP, 0, 700, 1, FALSE, 128 /*SHIFTJIS*/, 0, 5, 0, face, &fj) >= 0)
+    g_jpFace = font_installed(OVL_FONT_FACE_JP) ? OVL_FONT_FACE_JP : NULL;
+    void* fj = font_new(dev, ovl_scaled(OVL_FONT_H_JP, pct), 1);
+    if (fj) {
         g_fontJp = fj;
-    if (g_fontJp) {
         ff132_loga(FF132_TAG "overlay: Japanese font ready (%s, height %d)\n",
-               face ? OVL_FONT_FACE_JP : "system default (" OVL_FONT_FACE_JP " not installed)",
-               OVL_FONT_H_JP);
-        int aA = font_ascent(g_font), aJ = font_ascent(g_fontJp);
-        if (aA > 0 && aJ > 0) g_jpYoff = aA - aJ;
-        ff132_loga(FF132_TAG "overlay: ascent ascii %d, jp %d -> jp runs drawn %+dpx (one baseline)\n",
-               aA, aJ, g_jpYoff);
+               g_jpFace ? OVL_FONT_FACE_JP : "system default (" OVL_FONT_FACE_JP " not installed)",
+               ovl_scaled(OVL_FONT_H_JP, pct));
     } else {
         g_fontJpMissing = 1;
         ff132_loga(FF132_TAG "overlay: no Japanese font -- the mod's own text switches to English\n");
     }
+    scale_take(pct);
     D3DXCreateSprite_t pCS = (D3DXCreateSprite_t)GetProcAddress(hx, "D3DXCreateSprite");
     void* sp = NULL;
     if (pCS && pCS(dev, &sp) >= 0 && sp) g_sprite = sp;
@@ -754,12 +864,16 @@ void ff132_overlay_frame(void* wrapper) {
         ((Release_t)(*(void***)bb)[IUNK_VT_RELEASE])(bb);   // identity kept, reference dropped
         g_bbCache = bb; g_bbCacheDev = dev;
         // D3DSURFACE_DESC: Format, Type, Usage, Pool, MultiSampleType, MultiSampleQuality, Width,
-        // Height -- eight DWORDs, so the width is the seventh. IDirect3DSurface9::GetDesc is slot 12.
+        // Height -- eight DWORDs, so the width is the seventh and the height the eighth.
+        // IDirect3DSurface9::GetDesc is slot 12.
         {
             DWORD d[8] = {0};
             typedef HRESULT (__stdcall *GetDesc_t)(void*, void*);
             void** bvt = *(void***)bb;
-            if (bvt && ((GetDesc_t)bvt[12])(bb, d) >= 0 && d[6] > 100) g_bbWidth = (int)d[6];
+            if (bvt && ((GetDesc_t)bvt[12])(bb, d) >= 0) {
+                if (d[6] > 100) g_bbWidth = (int)d[6];
+                if (d[7] > 100) g_bbHeight = (int)d[7];
+            }
         }
     }
     void* rt = NULL;
@@ -785,11 +899,18 @@ void ff132_overlay_frame(void* wrapper) {
         if (!onBackbuffer) return;
         if (!g_bbFirstLogged) {
             g_bbFirstLogged = 1;
-            ff132_loga(FF132_TAG "overlay: drawing on the back-buffer pass (width %d)\n", g_bbWidth);
+            ff132_loga(FF132_TAG "overlay: drawing on the back-buffer pass (%dx%d)\n", g_bbWidth, g_bbHeight);
         }
     }
     // Fonts exist now; nothing to draw this pass.
     if (!flashOn && !battleOn && !tidyOn && !speedOn && !encOn && !killOn && !arOn && !helpOn) return;
+
+    // Before the sprite begins, so no face is in use: the setting may have moved since the last pass,
+    // or auto may have met a new back buffer (the first one, or one a Reset brought).
+    {
+        int want = scale_wanted();
+        if (want != g_scalePct && want != g_scaleFail) overlay_rescale(dev, want);
+    }
 
     // Plain ALPHABLEND on purpose: SORT_TEXTURE reorders across textures, and a JP run's shadow
     // (2px off) could then land on top of its ASCII neighbour's body.
@@ -805,16 +926,33 @@ void ff132_overlay_frame(void* wrapper) {
             ff132_loga(FF132_TAG "overlay: first line drawn\n");
         }
     }
-    int y = 14;
+    int m = ovl_margin(), y = m;
     g_drawDev = dev;                                // ff132_ovl_backdrop's device, for this pass only
-    if (helpOn)   y = ff132_setup_draw(14, y);
-    if (battleOn) y = ff132_battle_draw(14, y);
-    if (killOn)   y = ff132_kill_draw(14, y);
-    if (speedOn)  y = ff132_speed_draw(14, y);
-    if (encOn)    y = ff132_encount_draw(14, y);
-    if (arOn)     y = ff132_autoretry_draw(14, y);
-    if (flashOn)  overlay_say_wrap(g_font, 14, 14, y, g_flash, g_flashCol, FF132_OVL_LINE_H, 1, NULL);
-    if (tidyOn)   ff132_tidy_draw(14, FF132_TIDY_TOP);
+    if (helpOn) {
+        y = ff132_setup_draw(m, y);
+        // Straight under the settings screen, which keeps room for it when it has to scroll: below the
+        // status lines it would land off the bottom of the screen, and it answers what was just done.
+        if (flashOn) {
+            y += g_lineH * overlay_say_wrap(g_font, m, m, y, g_flash, g_flashCol, g_lineH, 1, NULL);
+            flashOn = 0;
+        }
+    }
+    if (battleOn) y = ff132_battle_draw(m, y);
+    if (killOn)   y = ff132_kill_draw(m, y);
+    if (speedOn)  y = ff132_speed_draw(m, y);
+    if (encOn)    y = ff132_encount_draw(m, y);
+    if (arOn)     y = ff132_autoretry_draw(m, y);
+    if (flashOn)  overlay_say_wrap(g_font, m, m, y, g_flash, g_flashCol, g_lineH, 1, NULL);
+    if (tidyOn) {
+        // Lifted when a short screen (or a large text size) would cut the blocks off at the bottom: a
+        // menu that cannot be read whole is worse than one drawn over the status lines.
+        int top = ovl_scaled(FF132_TIDY_TOP, g_scalePct), h = ff132_tidy_height();
+        if (g_bbHeight > 0 && top + h > g_bbHeight) {
+            top = g_bbHeight - h;
+            if (top < m) top = m;
+        }
+        ff132_tidy_draw(m, top);
+    }
     g_drawDev = NULL;
     if (g_spriteActive) {                           // buffered text renders here
         void* sp = g_spriteActive;
@@ -846,7 +984,8 @@ static void com_op(void* obj, int slot) {
 // default-pool GPU objects. Release them BEFORE the game's own Reset (an unreleased one makes it
 // fail with D3DERR_INVALIDCALL), chain, then restore them on success.
 static HRESULT __stdcall hkReset(void* dev, FF132_D3DPP* pp) {
-    g_bbCache = NULL; g_bbCacheDev = NULL; g_bbWidth = 0;   // Reset recreates it; refetch lazily
+    // Reset recreates it; refetch lazily (and a new height can move an auto text size with it).
+    g_bbCache = NULL; g_bbCacheDev = NULL; g_bbWidth = 0; g_bbHeight = 0;
     if (g_backdropSB) {      // an outstanding state block is enough to make the game's Reset fail
         ((Release_t)(*(void***)g_backdropSB)[IUNK_VT_RELEASE])(g_backdropSB);
         g_backdropSB = NULL;
@@ -861,6 +1000,7 @@ static HRESULT __stdcall hkReset(void* dev, FF132_D3DPP* pp) {
         com_op(g_font,   FONT_VT_ONRESET);
         com_op(g_fontJp, FONT_VT_ONRESET);
         com_op(g_sprite, SPRITE_VT_ONRESET);
+        g_scaleFail = 0;     // a size that could not be made on the device before is worth one more try
         ff132_loga(FF132_TAG "overlay: device reset handled\n");
     }
     return hr;

@@ -46,9 +46,9 @@ enum {
     R_H_KEYS, R_K_HELP, R_K_SPEED, R_K_KILL, R_K_ENC, R_K_RAUTO, R_K_SLOT, R_K_TIDY, R_K_BATTLE,
     R_KEYS,
     R_H_SET, R_FOCUS, R_SLOTS, R_REDIR, R_KNOTE, R_NOMOD,
-    R_HIST, R_RECAP, R_MULT, R_LOG, R_N
+    R_HIST, R_RECAP, R_MULT, R_FONT, R_LOG, R_N
 };
-enum { K_HEAD, K_KEY, K_KEYS, K_BOOL, K_SLOT, K_SLOTS, K_NOMOD, K_MULT, K_LOG };
+enum { K_HEAD, K_KEY, K_KEYS, K_BOOL, K_SLOT, K_SLOTS, K_NOMOD, K_MULT, K_FONT, K_LOG };
 static int row_kind(int r) {
     if (r == R_H_KEYS || r == R_H_SET) return K_HEAD;
     if (r >= R_K_HELP && r <= R_K_BATTLE) return K_KEY;
@@ -57,6 +57,7 @@ static int row_kind(int r) {
     if (r == R_SLOTS) return K_SLOTS;
     if (r == R_NOMOD) return K_NOMOD;
     if (r == R_MULT) return K_MULT;
+    if (r == R_FONT) return K_FONT;
     if (r == R_LOG) return K_LOG;
     return K_BOOL;
 }
@@ -410,6 +411,41 @@ static void nomod_cycle(int dir) {
     if (!ff132_nomod_set(pos - 2)) ff132_flash_c(ui_text(T_TD_CAT_FAIL), FF132_COL_MENU_OFF);
 }
 
+// ---- the text size ----------------------------------------------------------------------------
+// Its stops: auto, then sizes in percent of the original. A size set by hand in the ini that is not
+// a stop steps to the nearest stop the way the key points.
+static const int kScaleStops[] = { FF132_SCALE_AUTO, 75, 100, 125, 150, 175, 200, 250, 300 };
+#define SCALE_STOPS ((int)(sizeof kScaleStops / sizeof kScaleStops[0]))
+
+// The ini's spelling: "auto", or the factor as the ini takes it ("1.25", "2").
+static void scale_ini(int pct, char* out, size_t n) {
+    if (pct == FF132_SCALE_AUTO) { snprintf(out, n, "auto"); return; }
+    snprintf(out, n, "%d.%02d", pct / 100, pct % 100);
+    size_t l = strlen(out);
+    while (l > 1 && out[l - 1] == '0') out[--l] = 0;
+    if (l > 1 && out[l - 1] == '.') out[--l] = 0;
+}
+
+static void scale_cycle(int dir) {
+    int v = g_ovlScale, at = -1, nv;
+    for (int i = 0; i < SCALE_STOPS; i++) if (kScaleStops[i] == v) at = i;
+    if (at >= 0) {
+        nv = kScaleStops[(at + (dir > 0 ? 1 : SCALE_STOPS - 1)) % SCALE_STOPS];
+    } else {
+        // Off the stops: the first one past it the way the key points, else round to auto.
+        nv = FF132_SCALE_AUTO;
+        if (dir > 0) {
+            for (int i = 1; i < SCALE_STOPS; i++) if (kScaleStops[i] > v) { nv = kScaleStops[i]; break; }
+        } else {
+            for (int i = SCALE_STOPS - 1; i >= 1; i--) if (kScaleStops[i] < v) { nv = kScaleStops[i]; break; }
+        }
+    }
+    g_ovlScale = nv;                    // the render thread remakes the faces on its next pass
+    char val[16];
+    scale_ini(nv, val, sizeof val);
+    setting_write("overlay", "font_scale", val);
+}
+
 // ---- left/right and confirm -------------------------------------------------------------------
 static const char* const kLogName[3] = { "quiet", "normal", "verbose" };
 
@@ -438,6 +474,9 @@ void ff132_setup_cycle(int dir) {
         break;
     case K_NOMOD:
         nomod_cycle(dir);
+        break;
+    case K_FONT:
+        scale_cycle(dir);
         break;
     case K_LOG: {
         int l = g_logLevel;
@@ -597,11 +636,13 @@ static void wslot_value(char* out, size_t n) {
 // the right arrows of every row stand in one column. `bare` lays spaces where the arrows would be,
 // for a row that cannot change but should still read in the same column.
 static void arrows_fit_ex(char* out, size_t n, const char* value, int bare) {
-    char s0[48], s3[16];
+    char s0[48], s3[16], s4[16];
     snprintf(s0, sizeof s0, ui_text(T_SET_SLOT_LAST_N), FF132_SLOTS_MAX);
     snprintf(s3, sizeof s3, "%d", FF132_SLOTS_MAX);
+    snprintf(s4, sizeof s4, "%d%%", FF132_SCALE_MAX);
     const char* const pool[] = { ui_text(T_SET_ON), ui_text(T_SET_OFF), s0, s3,
-                                 kLogName[0], kLogName[1], kLogName[2] };
+                                 kLogName[0], kLogName[1], kLogName[2],
+                                 ui_text(T_SET_FONT_AUTO), s4 };
     // Centred between the arrows: the gap to the widest value is split in px, each half laid from
     // measured spaces, so a value one cell short of the widest does not sit half a cell off.
     int mx = 0;
@@ -707,6 +748,15 @@ static unsigned long row_text(int r, int sel, int cap, char* out, size_t n) {
             o += snprintf(out + o, n - (size_t)o, "%s%s%s", i ? " " : "",
                           (r == sel && i == ms) ? ">" : "", v);
         }
+        break;
+    }
+    case K_FONT: {
+        char sv[24];
+        int v = g_ovlScale;
+        if (v == FF132_SCALE_AUTO) snprintf(sv, sizeof sv, "%s", ui_text(T_SET_FONT_AUTO));
+        else                       snprintf(sv, sizeof sv, "%d%%", v);
+        arrows_fit(k, sizeof k, sv);
+        snprintf(out, n, "%s %s:" ROW_TAB "%s", mark, ui_text(T_SET_L_FONT), k);
         break;
     }
     case K_LOG: {
@@ -816,6 +866,7 @@ static void footer_text(int sel, int cap, char* out, size_t n) {
             snprintf(body + o, sizeof body - (size_t)o, FOOT_BREAK "%s", ui_text(why));
         break;
     }
+    case R_FONT:     snprintf(body, sizeof body, ui_text(T_SET_F_FONT), ff132_ovl_scale_pct()); break;
     case R_LOG:      snprintf(body, sizeof body, "%s", ui_text(T_SET_F_LOG));    break;
     default:         body[0] = 0; break;
     }
@@ -838,6 +889,10 @@ static int foot_say(int x, int y, char* foot, int draw) {
     }
     return rows;
 }
+
+// The first row drawn while the screen is too short to show them all. Render thread; kept from frame
+// to frame, so the window only moves when the selected row would leave it.
+static int g_scrollTop = 0;
 
 int ff132_setup_draw(int x, int y) {
     static char rows[R_N][384];
@@ -867,34 +922,74 @@ int ff132_setup_draw(int x, int y) {
         int w = x + ff132_ovl_text_w(rows[r]) + cw;
         if (w > valX) valX = w;
     }
+    int lh = FF132_OVL_LINE_H;
     int titleRows = ff132_ovl_wrap_count(x, x, title);
-    int lines = titleRows + foot_say(x, 0, foot, 0);
-    int hintX = x, hintRow = 0, selY = y + titleRows * FF132_OVL_LINE_H, selRows = 1;
+    int footRows = foot_say(x, 0, foot, 0);
+    int nr[R_N], body = 0;
+    int hintX = x, hintRow = 0;
     for (int r = 0; r < R_N; r++) {
-        int n = vals[r] ? ff132_ovl_wrap_count(valX, contX, vals[r] + 1)
+        nr[r] = vals[r] ? ff132_ovl_wrap_count(valX, contX, vals[r] + 1)
               : (r == sel && hint[0]) ? ff132_ovl_wrap_tail(x, contX, rows[r], hint, &hintX, &hintRow)
                                       : ff132_ovl_wrap_count(x, contX, rows[r]);
-        if (r < sel) selY += n * FF132_OVL_LINE_H;
-        if (r == sel) selRows = n;
-        lines += n;
+        body += nr[r];
     }
-    ff132_ovl_backdrop(0, y - 4, 4096, y + lines * FF132_OVL_LINE_H + 8, 0x99000000);
-    if (sel >= 0 && sel < R_N) FF132_MENU_BAND(selY, selRows);
-    y += FF132_OVL_LINE_H * ff132_ovl_say_wrap(x, x, y, title, FF132_COL_TITLE, FF132_OVL_LINE_H);
-    for (int r = 0; r < R_N; r++) {
+    // A screen too short for every row (a large text size, or a small window) shows a window of them
+    // between the title and the footer, kept around the selected row, with a mark on the side rows
+    // are left out on. Two rows stay free under the screen for the flash, which the overlay draws
+    // there: it is what answers a setting that could not be changed.
+    int first = 0, last = R_N, marks = 0;
+    int scrH = ff132_ovl_screen_h();
+    if (scrH > 0 && y + (titleRows + body + footRows) * lh + ff132_ovl_px(8) > scrH) {
+        int s = (sel >= 0 && sel < R_N) ? sel : R_K_SPEED;
+        int room = (scrH - y - ff132_ovl_px(12) - ff132_ovl_px(8)) / lh - titleRows - footRows
+                 - 2 /* the marks */ - 2 /* the flash */;
+        if (room < nr[s]) room = nr[s];
+        int top = g_scrollTop;
+        if (top < 0 || top >= R_N) top = 0;
+        if (top > s) top = s;
+        // A heading right above the selected row comes into view with it.
+        if (top == s && s > 0 && row_kind(s - 1) == K_HEAD && nr[s - 1] + nr[s] <= room) top = s - 1;
+        int used = 0;
+        for (int r = top; r <= s; r++) used += nr[r];
+        while (used > room && top < s) used -= nr[top++];
+        last = s + 1;
+        while (last < R_N && used + nr[last] <= room) used += nr[last++];
+        // At the end of the list, rows above take up what is left instead of the space going empty.
+        while (last == R_N && top > 0 && used + nr[top - 1] <= room) used += nr[--top];
+        g_scrollTop = first = top;
+        marks = 1;
+    }
+    int lines = titleRows + footRows + (marks ? 2 : 0);
+    for (int r = first; r < last; r++) lines += nr[r];
+    int selY = y + (titleRows + marks) * lh, selRows = 1;
+    for (int r = first; r < last && r < sel; r++) selY += nr[r] * lh;
+    if (sel >= first && sel < last) selRows = nr[sel];
+    ff132_ovl_backdrop(0, y - ff132_ovl_px(4), FF132_OVL_FULL_W, y + lines * lh + ff132_ovl_px(8),
+                       0x99000000);
+    if (sel >= first && sel < last) FF132_MENU_BAND(selY, selRows);
+    y += lh * ff132_ovl_say_wrap(x, x, y, title, FF132_COL_TITLE, lh);
+    if (marks) {
+        if (first > 0) ff132_ovl_say(x + 2 * cw, y, "\xE2\x96\xB2", FF132_COL_MENU_OFF);   // U+25B2
+        y += lh;
+    }
+    for (int r = first; r < last; r++) {
         int n;
         if (vals[r]) {
             ff132_ovl_say(x, y, rows[r], cols[r]);
-            n = ff132_ovl_say_wrap(valX, contX, y, vals[r] + 1, cols[r], FF132_OVL_LINE_H);
+            n = ff132_ovl_say_wrap(valX, contX, y, vals[r] + 1, cols[r], lh);
         } else {
-            n = ff132_ovl_say_wrap(x, contX, y, rows[r], cols[r], FF132_OVL_LINE_H);
+            n = ff132_ovl_say_wrap(x, contX, y, rows[r], cols[r], lh);
         }
         if (!vals[r] && r == sel && hint[0]) {
-            ff132_ovl_say(hintX, y + hintRow * FF132_OVL_LINE_H, hint, FF132_COL_MENU_OFF);
-            n = selRows;
+            ff132_ovl_say(hintX, y + hintRow * lh, hint, FF132_COL_MENU_OFF);
+            n = nr[r];
         }
-        y += FF132_OVL_LINE_H * n;
+        y += lh * n;
     }
-    y += FF132_OVL_LINE_H * foot_say(x, y, foot, 1);
-    return y + 12;
+    if (marks) {
+        if (last < R_N) ff132_ovl_say(x + 2 * cw, y, "\xE2\x96\xBC", FF132_COL_MENU_OFF);  // U+25BC
+        y += lh;
+    }
+    y += lh * foot_say(x, y, foot, 1);
+    return y + ff132_ovl_px(12);
 }

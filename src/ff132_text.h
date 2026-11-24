@@ -83,6 +83,7 @@ typedef enum {
     T_SET_L_RECAP,
     T_SET_L_MULT,
     T_SET_L_LOG,
+    T_SET_L_FONT,
     T_SET_SLOT_LAST_N,
     T_SET_SLOT_LAST,
     T_SET_F_SPEED,
@@ -101,6 +102,7 @@ typedef enum {
     T_SET_F_RECAP,
     T_SET_F_MULT,
     T_SET_F_LOG,
+    T_SET_F_FONT,                   // %d = the text size in force, in percent
     T_SET_F_CAPTURE,
     T_SET_F_DUP,
     T_SET_CANT_UNBIND_HELP,
@@ -113,6 +115,7 @@ typedef enum {
     T_SET_HINT_CHANGE,
     T_SET_V_MULT_IN,                // %s = factor; in the hotkey cycle
     T_SET_V_MULT_OUT,               // ...and not in it
+    T_SET_FONT_AUTO,                // the text size's auto stop, as its row shows it
     T_SET_L_SLOTS,
     T_SET_F_SLOTS,                  // %d = the most it can be set to
     T_SET_SLOTS_CLOUD,
@@ -314,6 +317,7 @@ static const char* const kTextEn[T_COUNT] = {
     /* T_SET_L_RECAP              */ "Skip the recap after a load",
     /* T_SET_L_MULT               */ "GAME SPEED factors",
     /* T_SET_L_LOG                */ "Log level",
+    /* T_SET_L_FONT               */ "Text size",
     /* T_SET_SLOT_LAST_N          */ "ON (%d)",
     /* T_SET_SLOT_LAST            */ "ON",
     /* T_SET_F_SPEED              */ "Each press: %s in turn. The factors are set on the \"GAME SPEED factors\" row",
@@ -332,6 +336,7 @@ static const char* const kTextEn[T_COUNT] = {
     /* T_SET_F_RECAP              */ "skips the narration and the movie after a save is loaded",
     /* T_SET_F_MULT               */ "[%s/%s] = pick  %s = in or out; up to 8 of them, stepped in ascending order: %s",
     /* T_SET_F_LOG                */ "quiet = errors and startup only / normal = + your actions' results / verbose = + the game's internals",
+    /* T_SET_F_FONT               */ "the size of this mod's text, now %d%%. 100%% = the original size, auto = follows the screen's resolution (100%% at 720p). When this screen does not fit, it scrolls; the ini takes any size from 0.5 to 4",
     /* T_SET_F_CAPTURE            */ "Press the new key (the current key again = unbind; [%s] or [%s] = cancel)",
     /* T_SET_F_DUP                */ "! the same key as another function -- ",
     /* T_SET_CANT_UNBIND_HELP     */ "the key that opens this screen cannot be unbound",
@@ -344,6 +349,7 @@ static const char* const kTextEn[T_COUNT] = {
     /* T_SET_HINT_CHANGE          */ "  (%s to change)",
     /* T_SET_V_MULT_IN            */ "[%s]",
     /* T_SET_V_MULT_OUT           */ " %s ",
+    /* T_SET_FONT_AUTO            */ "auto",
     /* T_SET_L_SLOTS              */ "Save slot limit",
     /* T_SET_F_SLOTS              */ "40 = the game's own, up to %d. Before removing this mod or lowering this, move saves 41 and up to free numbers 1-40 -- left there, they close the game as a save list opens",
     /* T_SET_SLOTS_CLOUD          */ "Save slot limit: cannot be changed while Steam Cloud sync is on for this game",
@@ -544,6 +550,7 @@ static const char* const kTextJp[T_COUNT] = {
     /* T_SET_L_RECAP              */ "ロード直後のあらすじ省略",
     /* T_SET_L_MULT               */ "「GAME SPEED」の倍率設定",
     /* T_SET_L_LOG                */ "ログレベル",
+    /* T_SET_L_FONT               */ "文字サイズ",
     /* T_SET_SLOT_LAST_N          */ "ON(%d)",
     /* T_SET_SLOT_LAST            */ "ON",
     /* T_SET_F_SPEED              */ "キー入力ごとに%sの順で切替。下の \"「GAME SPEED」の倍率設定\" の行で変更可能",
@@ -562,6 +569,7 @@ static const char* const kTextJp[T_COUNT] = {
     /* T_SET_F_RECAP              */ "セーブデータをロード時のナレーションとムービーをスキップする",
     /* T_SET_F_MULT               */ "[%s/%s]=候補を選ぶ %s=入れる/外す。最大8個まで、押す順は昇順: %s",
     /* T_SET_F_LOG                */ "quiet=エラーと起動時のみ / normal=+操作の結果 / verbose=+ゲーム内部の動作",
+    /* T_SET_F_FONT               */ "Modが表示する文字の大きさ(現在%d%%)。100%%=元の大きさ、自動=画面の解像度に合わせる(720pで100%%)。\nこの画面が収まらないときはスクロールする。iniでは0.5〜4の任意の値も可",
     /* T_SET_F_CAPTURE            */ "新しいキーを押してください(今のキーをもう一度押すと解除、[%s]か[%s]で中止)",
     /* T_SET_F_DUP                */ "! 他の機能と同じキー — ",
     /* T_SET_CANT_UNBIND_HELP     */ "この画面を開くキーは解除できません",
@@ -574,6 +582,7 @@ static const char* const kTextJp[T_COUNT] = {
     /* T_SET_HINT_CHANGE          */ "  (%sで変更)",
     /* T_SET_V_MULT_IN            */ "●%s",
     /* T_SET_V_MULT_OUT           */ "○%s",
+    /* T_SET_FONT_AUTO            */ "自動",
     /* T_SET_L_SLOTS              */ "セーブ枠の上限",
     /* T_SET_F_SLOTS              */ "40=ゲーム本来の数、最大%d。\nModを外す・数を減らす前に、セーブデータ41以降を1〜40の空きへ移すこと(残すと一覧を開いた瞬間にゲームが終了する)",
     /* T_SET_SLOTS_CLOUD          */ "セーブ枠の上限: Steam Cloud同期がONの間は変えられません",

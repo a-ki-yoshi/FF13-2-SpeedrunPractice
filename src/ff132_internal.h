@@ -186,7 +186,15 @@ int  ff132_ovl_wrap_count(int x, int contX, const char* utf8);   // the rows ff1
 // does not fit there; *tailX / *tailRow (0-based) say where to draw the tail.
 int  ff132_ovl_wrap_tail(int x, int contX, const char* utf8, const char* tail, int* tailX,
                       int* tailRow);
-#define FF132_OVL_LINE_H 24                  // one overlay row
+// The text size ([overlay] font_scale). Everything a block lays out in pixels is designed at 100% and
+// goes through these, so the rows grow with the text. Render thread, like the drawing helpers.
+int  ff132_ovl_line_h(void);                 // one overlay row at the size in force
+int  ff132_ovl_px(int px);                   // a distance designed at 100%, at the size in force
+int  ff132_ovl_full_w(void);                 // a backdrop's right edge: the whole screen's width
+int  ff132_ovl_screen_h(void);               // the back buffer's height; 0 = not known yet
+int  ff132_ovl_scale_pct(void);              // the size in force, in percent (auto resolved)
+#define FF132_OVL_LINE_H (ff132_ovl_line_h())   // one overlay row
+#define FF132_OVL_FULL_W (ff132_ovl_full_w())
 // The menus' palette.
 #define FF132_COL_MENU     0xFFFFD9E7
 #define FF132_COL_MENU_SEL 0xFFFFD168
@@ -194,7 +202,8 @@ int  ff132_ovl_wrap_tail(int x, int contX, const char* utf8, const char* tail, i
 #define FF132_COL_MENU_BAND     0x336767FA   // the quad behind the selected row
 // The band behind a selected row of `rows` rows at y: drawn after the backdrop, before any text.
 #define FF132_MENU_BAND(y, rows) \
-    ff132_ovl_backdrop(0, (y) - 2, 4096, (y) + (rows) * FF132_OVL_LINE_H + 2, FF132_COL_MENU_BAND)
+    ff132_ovl_backdrop(0, (y) - ff132_ovl_px(2), FF132_OVL_FULL_W, \
+                       (y) + (rows) * FF132_OVL_LINE_H + ff132_ovl_px(2), FF132_COL_MENU_BAND)
 #define FF132_COL_HEAD     0xFFC4CFCF
 #define FF132_COL_TITLE    0xFFFFFFFF
 #define FF132_COL_TEXT     0xFFFFFFFF   // menu lines that are not rows: key help, explanations
@@ -371,8 +380,11 @@ int  ff132_tidy_slot_no_id(int slot);        // 1 = the save's id field read emp
 void ff132_world_display(int row, int english, char* out, size_t n);
 void ff132_tidy_note_copied(int src, int dst);
 // Where the blocks start: clear of the flash line at the top left, and of the save list's own
-// thumbnails (y ~250 and below at 1280x720), which is what the list menu is drawn over.
+// thumbnails (y ~250 and below at 1280x720), which is what the list menu is drawn over. At 100%: the
+// overlay scales it with the text, and lifts the blocks when a short screen would cut them off.
 #define FF132_TIDY_TOP 160
+// Render thread: how tall ff132_tidy_draw's blocks come out (0 = none is up).
+int  ff132_tidy_height(void);
 
 // ---- the hotkeys-and-settings screen (ff132_setup.c) ----------------------------------------------
 // Everything but the two draw calls runs on the hotkey worker; the caller lifts the input gate
@@ -512,6 +524,13 @@ extern volatile int g_slotCount;      // [save] slot_count: FF132_SLOTS_GAME = t
 // game thread the save hook reads them from.
 extern volatile unsigned char g_autosaveRedirect;
 extern volatile unsigned char g_battleOverlay;
+// [overlay] font_scale: the size of everything the overlay draws, in percent of the original
+// (100 = 20px text, 24px rows), or FF132_SCALE_AUTO. Written by config_load and the settings screen
+// (worker), read by the render thread; a plain int, so a read never sees half a write.
+#define FF132_SCALE_AUTO 0
+#define FF132_SCALE_MIN  50
+#define FF132_SCALE_MAX  400
+extern volatile int g_ovlScale;
 
 // ---- reading the game's memory -----------------------------------------------------------------
 // A pointer that does not check out is a read skipped, never a fault.

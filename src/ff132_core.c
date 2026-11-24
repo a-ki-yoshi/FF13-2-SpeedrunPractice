@@ -41,6 +41,7 @@ UINT g_enemySuppressVk = VK_F5;                 // [hotkeys] enemy_suppress (def
 UINT g_battleRestartAutoVk = VK_F6;             // [hotkeys] battle_restart_auto (default F6)
 double g_gsSteps[FF132_GS_STEPS_MAX] = { 3.0 };    // [game_speed] multiplier (default 3.0)
 int g_gsStepN = 1;
+volatile int g_ovlScale = 100;                  // [overlay] font_scale (default 1 = the original size)
 // The defaults that are NOT here: g_battleOverlay (restored from the state file) and g_directLoad
 // ([load] skip_historia_crux) sit beside the toggles that are the only other things to write them.
 // GetAsyncKeyState reads the keyboard, not the window, so without this every hotkey here fires
@@ -312,6 +313,40 @@ static void gs_parse(const char* val) {
     g_gsStepN = n;
 }
 
+// [overlay] font_scale: "auto", a factor ("1.5") or a percentage ("150%"). Empty = the default. A
+// size outside FF132_SCALE_MIN..MAX is pulled to the nearer end rather than dropped: it was asked for,
+// and the end is the closest the overlay can come.
+static void scale_parse(const char* val) {
+    if (!val[0]) { g_ovlScale = 100; return; }
+    if (cfg_ieq(val, "auto")) { g_ovlScale = FF132_SCALE_AUTO; return; }
+    char* end = NULL;
+    double v = strtod(val, &end);
+    if (end == val) {
+        ff132_loga(FF132_TAG "config: font_scale=%s is not auto or a number -> 1\n", val);
+        g_ovlScale = 100;
+        return;
+    }
+    while (*end == ' ' || *end == '\t') end++;
+    if (*end == '%') {
+        v /= 100.0;
+        end++;
+        while (*end == ' ' || *end == '\t') end++;
+    }
+    if (*end || v != v) {                        // trailing text, or "nan"
+        ff132_loga(FF132_TAG "config: font_scale=%s is not auto or a number -> 1\n", val);
+        g_ovlScale = 100;
+        return;
+    }
+    int pct = v <= 0.0 ? 0 : v >= 100.0 ? FF132_SCALE_MAX + 1 : (int)(v * 100.0 + 0.5);
+    if (pct < FF132_SCALE_MIN || pct > FF132_SCALE_MAX) {
+        int to = pct < FF132_SCALE_MIN ? FF132_SCALE_MIN : FF132_SCALE_MAX;
+        ff132_loga(FF132_TAG "config: font_scale=%s is outside %d%%..%d%% -> %d%%\n", val,
+                   FF132_SCALE_MIN, FF132_SCALE_MAX, to);
+        pct = to;
+    }
+    g_ovlScale = pct;
+}
+
 void config_load(void) {
     char path[MAX_PATH];
     FILE* f = exe_sibling(path, sizeof(path), FF132_INI_NAME) ? fopen(path, "r") : NULL;
@@ -393,6 +428,8 @@ void config_load(void) {
                 else if (cfg_ieq(key, "skip_story_recap")) g_skipRecap = cfg_on(val) ? 1 : 0;
             } else if (cfg_ieq(section, "game_speed")) {
                 if (cfg_ieq(key, "multiplier")) gs_parse(val);
+            } else if (cfg_ieq(section, "overlay")) {
+                if (cfg_ieq(key, "font_scale")) scale_parse(val);
             } else if (cfg_ieq(section, "log")) {
                 if (cfg_ieq(key, "level")) {
                     if      (cfg_ieq(val, "quiet"))   g_logLevel = 0;
@@ -470,6 +507,10 @@ void config_load(void) {
            g_hkGlobal, g_logLevel,
            g_autosaveRedirect ? "on" : "off", g_directLoad ? "on" : "off",
            g_skipRecap ? "skipped" : "played", g_keepNote ? "on" : "off");
+    if (g_ovlScale == FF132_SCALE_AUTO)
+        ff132_loga(FF132_TAG "config: font_scale=auto (follows the screen height, 100%% at 720)\n");
+    else
+        ff132_loga(FF132_TAG "config: font_scale=%d%%\n", g_ovlScale);
 }
 
 // ---- writing one setting back ----------------------------------------------------------------

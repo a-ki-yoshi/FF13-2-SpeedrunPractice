@@ -126,6 +126,11 @@ Features that are switched ON/OFF keep their ON/OFF state after the game is rest
       - Sets the factors that "GAME SPEED" below steps through
       - On the hotkeys-and-settings screen you can register up to 8 of 0.5/1.5/2/3/4/5/6/8/10 (any value from 0.1 to 10 when written directly in the ini)
       - For example, with 3 and 8 registered, each press steps through 3x → 8x → OFF in turn
+    - Text size (default: 100%)
+      - Sets the size of the text this mod draws on the screen (the lines of the features that are on, the battle overlay and the menus)
+      - On the hotkeys-and-settings screen you can pick auto/75%/100%/125%/150%/175%/200%/250%/300% (any size from 0.5 to 4 when written directly in the ini)
+      - 100% is the size the text has always had. Auto grows it with the screen's resolution (100% at 720p, 150% at 1080p, 300% at 4K)
+      - A change takes effect at once. When the hotkeys-and-settings screen does not fit on the screen, it scrolls to keep the selected row in view
     - Log level (default: normal)
       - Sets how much detail the log records
       - Note that the log starts anew at every launch, and only the previous launch's log is kept, as `prev.log`

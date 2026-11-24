@@ -2164,6 +2164,19 @@ static const int kGroup[TIDY_ROWS] = { T_TD_GRP_FILTER,
                                        T_TD_GRP_CAT, -1, -1, -1, -1,
                                        T_TD_GRP_SORT, -1 };
 
+// The backdrop behind one block, and the lowest edge any block has drawn this frame: what
+// ff132_tidy_height reports, so the overlay can lift the blocks clear of a short screen's bottom.
+// Render thread.
+static int g_boxBottom = 0;
+static void tidy_box(int y0, int y1) {
+    ff132_ovl_backdrop(0, y0, FF132_OVL_FULL_W, y1, 0x99000000);
+    if (y1 > g_boxBottom) g_boxBottom = y1;
+}
+// A footer's rows never count as fewer than the three the boxes were sized at before they were
+// measured: the box only grows past its old size when a large text size wraps the footer further.
+#define FOOT_ROWS_MIN 3
+static int foot_rows(int n) { return n > FOOT_ROWS_MIN ? n : FOOT_ROWS_MIN; }
+
 // A category value padded to the widest name it can show (and <new category>, where that is a
 // stop), so the row's right arrow stays put as left and right walk it. Render thread.
 static void fit_cat(char* v, size_t n, const char* extra, int quoted) {
@@ -2265,9 +2278,20 @@ static int tidy_draw_menu(int x, int y) {
         if (kGroup[i] >= 0) { heads++; if (i <= sel) selY += FF132_OVL_LINE_H; }
         if (i < sel) selY += FF132_OVL_LINE_H;
     }
-    // Title + headings + the rows + two footer lines, one of which can wrap.
-    int rows = 1 + heads + TIDY_ROWS + 3;
-    ff132_ovl_backdrop(0, y - 4, 4096, y + rows * FF132_OVL_LINE_H + 8, 0x99000000);
+    // The two footer lines are made first, so the box can be sized to what they wrap to.
+    char foot[2][448], tk[32];
+    snprintf(foot[0], sizeof foot[0], ui_text(T_TD_KEYS_MOVE), up, down, left, right);
+    vk_label(g_saveTidyVk, tk, sizeof tk);
+    if      (g_sel == TIDY_FILTER)   snprintf(foot[1], sizeof foot[1], ui_text(T_TD_KEYS_RESET), ok, cancel, tk);
+    else if (g_sel == TIDY_CAT_PICK) snprintf(foot[1], sizeof foot[1], ui_text(T_TD_CAT_KEYS), left, right, ok);
+    else if (g_sel == TIDY_CAT_DEL)  snprintf(foot[1], sizeof foot[1], ui_text(T_TD_CAT_DEL_KEYS), left,
+                                              right, ok);
+    else if (g_sel == TIDY_RENUM)    snprintf(foot[1], sizeof foot[1], ui_text(T_TD_RENUM_KEYS), ok, cancel, tk);
+    else                             snprintf(foot[1], sizeof foot[1], ui_text(T_TD_KEYS_CLOSE), cancel, tk);
+    int footN = ff132_ovl_wrap_count(x, x, foot[0]) + ff132_ovl_wrap_count(x, x, foot[1]);
+    // Title + headings + the rows + the footer.
+    int rows = 1 + heads + TIDY_ROWS + foot_rows(footN);
+    tidy_box(y - ff132_ovl_px(4), y + rows * FF132_OVL_LINE_H + ff132_ovl_px(8));
     if (sel >= 0 && sel < TIDY_ROWS) FF132_MENU_BAND(selY, 1);
     ff132_ovl_say(x, y, ui_text(T_TD_HEAD), FF132_COL_TITLE); y += FF132_OVL_LINE_H;
     for (int i = 0; i < TIDY_ROWS; i++) {
@@ -2275,26 +2299,39 @@ static int tidy_draw_menu(int x, int y) {
         snprintf(buf, sizeof buf, "   %s %s", (i == sel) ? ">" : " ", row[i]);
         ff132_ovl_say(x, y, buf, col[i]); y += FF132_OVL_LINE_H;
     }
-    snprintf(buf, sizeof buf, ui_text(T_TD_KEYS_MOVE), up, down, left, right);
-    y += FF132_OVL_LINE_H * ff132_ovl_say_wrap(x, x, y, buf, FF132_COL_TEXT, FF132_OVL_LINE_H);
-    char tk[32];
-    vk_label(g_saveTidyVk, tk, sizeof tk);
-    if      (g_sel == TIDY_FILTER)   snprintf(buf, sizeof buf, ui_text(T_TD_KEYS_RESET), ok, cancel, tk);
-    else if (g_sel == TIDY_CAT_PICK) snprintf(buf, sizeof buf, ui_text(T_TD_CAT_KEYS), left, right, ok);
-    else if (g_sel == TIDY_CAT_DEL)  snprintf(buf, sizeof buf, ui_text(T_TD_CAT_DEL_KEYS), left, right,
-                                              ok);
-    else if (g_sel == TIDY_RENUM)    snprintf(buf, sizeof buf, ui_text(T_TD_RENUM_KEYS), ok, cancel, tk);
-    else                             snprintf(buf, sizeof buf, ui_text(T_TD_KEYS_CLOSE), cancel, tk);
-    y += FF132_OVL_LINE_H * ff132_ovl_say_wrap(x, x, y, buf, FF132_COL_TEXT, FF132_OVL_LINE_H);
+    for (int f = 0; f < 2; f++)
+        y += FF132_OVL_LINE_H * ff132_ovl_say_wrap(x, x, y, foot[f], FF132_COL_TEXT, FF132_OVL_LINE_H);
     return y + FF132_OVL_LINE_H / 2;      // half a line, so two blocks read as two blocks
 }
 
 // The buffer the message thread is typing into, as one line with the caret on its end. Converted
 // here rather than kept as UTF-8 because a backspace has to take a whole character with it.
 static int edit_draw(int x, int y) {
-    char buf[384], text[EDIT_BUF * 3];
+    char buf[384], text[EDIT_BUF * 3], help[384], keys[384];
     int mode = g_editMode;
-    ff132_ovl_backdrop(0, y - 4, 4096, y + 5 * FF132_OVL_LINE_H + 8, 0x99000000);
+    int bad = g_editBad;
+    // The two lines under the input are made first, so the box can be sized to what they wrap to.
+    if (mode == EDIT_NOTE) {
+        if (bad) snprintf(help, sizeof help, ui_text(T_TD_EDIT_BAD), FF132_NOTE_CHARS);
+        else     snprintf(help, sizeof help, "%s", ui_text(T_TD_EDIT_HELP));
+    } else {
+        // A refused keystroke shows the help line itself in red: what may go in a name IS the
+        // answer to it, and a second wording for the same rule would only be one more place to
+        // keep in step.
+        snprintf(help, sizeof help, "%s",
+                 ui_text(bad == EDIT_BAD_EXISTS ? T_TD_EDIT_CAT_EXISTS
+                     : bad == EDIT_BAD_NAME   ? T_TD_EDIT_CAT_BADNAME : T_TD_EDIT_CAT_HELP));
+    }
+    {
+        char k[32], ok[40];
+        vk_label(g_saveTidyVk, k, sizeof k);
+        ff132_tidy_ok_phrase(ok, sizeof ok);
+        snprintf(keys, sizeof keys, ui_text(mode == EDIT_NOTE ? T_TD_EDIT_KEYS
+                                                     : T_TD_EDIT_CAT_KEYS), ok, k);
+    }
+    int footN = ff132_ovl_wrap_count(x, x, help) + ff132_ovl_wrap_count(x, x, keys);
+    // Title + the input line + the two lines under it.
+    tidy_box(y - ff132_ovl_px(4), y + (2 + foot_rows(footN)) * FF132_OVL_LINE_H + ff132_ovl_px(8));
     if (mode == EDIT_NOTE) snprintf(buf, sizeof buf, ui_text(T_TD_EDIT_HEAD), FF132_NOTE_CHARS);
     else snprintf(buf, sizeof buf,
                   ui_text(mode == EDIT_CAT_RENAME  ? T_TD_EDIT_CAT_RENAME_HEAD
@@ -2313,28 +2350,9 @@ static int edit_draw(int x, int y) {
     if (n) WideCharToMultiByte(CP_UTF8, 0, snap, -1, text, (int)sizeof text, NULL, NULL);
     snprintf(buf, sizeof buf, "   > %s_", text);
     ff132_ovl_say(x, y, buf, FF132_COL_MENU_SEL); y += FF132_OVL_LINE_H;
-    int bad = g_editBad;
-    if (mode == EDIT_NOTE) {
-        if (bad) snprintf(buf, sizeof buf, ui_text(T_TD_EDIT_BAD), FF132_NOTE_CHARS);
-        else     snprintf(buf, sizeof buf, "%s", ui_text(T_TD_EDIT_HELP));
-    } else {
-        // A refused keystroke shows the help line itself in red: what may go in a name IS the
-        // answer to it, and a second wording for the same rule would only be one more place to
-        // keep in step.
-        snprintf(buf, sizeof buf, "%s",
-                 ui_text(bad == EDIT_BAD_EXISTS ? T_TD_EDIT_CAT_EXISTS
-                     : bad == EDIT_BAD_NAME   ? T_TD_EDIT_CAT_BADNAME : T_TD_EDIT_CAT_HELP));
-    }
-    y += FF132_OVL_LINE_H * ff132_ovl_say_wrap(x, x, y, buf, bad ? FF132_COL_ERR : FF132_COL_TEXT,
+    y += FF132_OVL_LINE_H * ff132_ovl_say_wrap(x, x, y, help, bad ? FF132_COL_ERR : FF132_COL_TEXT,
                                          FF132_OVL_LINE_H);
-    {
-        char k[32], ok[40];
-        vk_label(g_saveTidyVk, k, sizeof k);
-        ff132_tidy_ok_phrase(ok, sizeof ok);
-        snprintf(buf, sizeof buf, ui_text(mode == EDIT_NOTE ? T_TD_EDIT_KEYS
-                                                   : T_TD_EDIT_CAT_KEYS), ok, k);
-    }
-    y += FF132_OVL_LINE_H * ff132_ovl_say_wrap(x, x, y, buf, FF132_COL_TEXT, FF132_OVL_LINE_H);
+    y += FF132_OVL_LINE_H * ff132_ovl_say_wrap(x, x, y, keys, FF132_COL_TEXT, FF132_OVL_LINE_H);
     return y + FF132_OVL_LINE_H / 2;
 }
 
@@ -2429,8 +2447,15 @@ static int lsel_draw(int x, int y) {
         col[i] = dim ? FF132_COL_MENU_OFF : (i == sel) ? FF132_COL_MENU_SEL : FF132_COL_MENU;
     }
     lsel_align_arrows(row[LSEL_COPY], row[LSEL_MOVE], sizeof row[0]);
-    // Title + the rows + a footer that can wrap.
-    ff132_ovl_backdrop(0, y - 4, 4096, y + (LSEL_ROWS + 4) * FF132_OVL_LINE_H + 8, 0x99000000);
+    // The footer is made first, so the box can be sized to what it wraps to.
+    char foot[448];
+    if (g_lselSel == LSEL_COPY || g_lselSel == LSEL_MOVE)
+        snprintf(foot, sizeof foot, ui_text(T_TD_LSEL_SEND_KEYS), up, down, left, right,
+                 ui_text(g_lselSel == LSEL_COPY ? T_TD_SEND_DEST_COPY : T_TD_SEND_DEST_MOVE), ok, k);
+    else snprintf(foot, sizeof foot, ui_text(T_TD_LSEL_KEYS), up, down, ok, k);
+    // Title + the rows + the footer.
+    int rows = 1 + LSEL_ROWS + foot_rows(ff132_ovl_wrap_count(x, x, foot));
+    tidy_box(y - ff132_ovl_px(4), y + rows * FF132_OVL_LINE_H + ff132_ovl_px(8));
     if (sel >= 0 && sel < LSEL_ROWS) FF132_MENU_BAND(y + (1 + sel) * FF132_OVL_LINE_H, 1);
     if (slot >= 0) snprintf(buf, sizeof buf, ui_text(T_TD_LSEL_HEAD), slot + 1, pick);
     else           snprintf(buf, sizeof buf, ui_text(T_TD_LSEL_HEAD_NEW), pick);
@@ -2439,18 +2464,40 @@ static int lsel_draw(int x, int y) {
         snprintf(buf, sizeof buf, "   %s %s", (i == sel) ? ">" : " ", row[i]);
         ff132_ovl_say(x, y, buf, col[i]); y += FF132_OVL_LINE_H;
     }
-    if (g_lselSel == LSEL_COPY || g_lselSel == LSEL_MOVE)
-        snprintf(buf, sizeof buf, ui_text(T_TD_LSEL_SEND_KEYS), up, down, left, right,
-                 ui_text(g_lselSel == LSEL_COPY ? T_TD_SEND_DEST_COPY : T_TD_SEND_DEST_MOVE), ok, k);
-    else snprintf(buf, sizeof buf, ui_text(T_TD_LSEL_KEYS), up, down, ok, k);
-    y += FF132_OVL_LINE_H * ff132_ovl_say_wrap(x, x, y, buf, FF132_COL_TEXT, FF132_OVL_LINE_H);
+    y += FF132_OVL_LINE_H * ff132_ovl_say_wrap(x, x, y, foot, FF132_COL_TEXT, FF132_OVL_LINE_H);
     return y + FF132_OVL_LINE_H / 2;
+}
+
+// Which blocks are up, and the row height they were laid out at: a height measured for another set,
+// or at another text size, is not the one to go by.
+static int tidy_blocks_key(void) {
+    int k = (g_edit ? 1 : 0) | (g_open ? 2 : 0) | (g_lselOpen ? 4 : 0);
+    return k ? k | (FF132_OVL_LINE_H << 3) : 0;
+}
+static int g_tidyH = 0, g_tidyHKey = 0;     // render thread: the last frame's height, and its key
+
+// The blocks' height as the last frame drew them, for the same blocks at the same size; otherwise the
+// counts the boxes are sized from, which is what they come to unless a footer wraps further.
+int ff132_tidy_height(void) {
+    int key = tidy_blocks_key();
+    if (!key) return 0;
+    if (key == g_tidyHKey && g_tidyH > 0) return g_tidyH;
+    int lh = FF132_OVL_LINE_H, heads = 0, h = 0;
+    for (int i = 0; i < TIDY_ROWS; i++) if (kGroup[i] >= 0) heads++;
+    if (key & 1) h += (2 + FOOT_ROWS_MIN) * lh + lh / 2;
+    if (key & 2) h += (1 + heads + TIDY_ROWS + FOOT_ROWS_MIN) * lh + lh / 2;
+    if (key & 4) h += (1 + LSEL_ROWS + FOOT_ROWS_MIN) * lh + lh / 2;
+    return h + ff132_ovl_px(8);
 }
 
 // The editor first so it sits above whichever menu opened it; the two menus never stand together.
 int ff132_tidy_draw(int x, int y) {
+    int key = tidy_blocks_key(), top = y;
+    g_boxBottom = y;
     if (g_edit)     y = edit_draw(x, y);
     if (g_open)     y = tidy_draw_menu(x, y);
     if (g_lselOpen) y = lsel_draw(x, y);
+    g_tidyH = (g_boxBottom > y ? g_boxBottom : y) - top;
+    g_tidyHKey = key;
     return y;
 }
